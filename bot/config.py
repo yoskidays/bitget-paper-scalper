@@ -9,9 +9,9 @@ from typing import Any
 APP_NAME = "BitgetPaperScalper"
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "config_version": 2,
+    "config_version": 3,
     "starting_equity": 50.0,
-    "scan_interval_minutes": 5,
+    "scan_interval_minutes": 1,
     "risk_per_trade_pct": 1.0,
     "fallback_risk_pct": 0.25,
     "max_leverage": 5.0,
@@ -30,12 +30,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "atr_stop_multiplier": 1.2,
     "min_stop_pct": 0.0035,
     "max_stop_pct": 0.015,
-    "max_hold_minutes": 120,
+    "max_hold_minutes": 60,
     "daily_loss_limit_pct": 3.0,
     "default_taker_fee_rate": 0.0006,
     "slippage_bps": 1.5,
     "request_timeout_seconds": 12,
     "api_base_url": "https://api.bitget.com",
+    "websocket_enabled": True,
+    "websocket_url": "wss://ws.bitget.com/v2/ws/public",
+    "websocket_heartbeat_seconds": 25,
+    "live_ui_throttle_seconds": 1.0,
     "product_type": "USDT-FUTURES",
     "dry_run_only": True,
     "auto_start_bot": True,
@@ -79,9 +83,12 @@ def _deep_merge(base: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any
 
 def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     cfg = _deep_merge(DEFAULT_CONFIG, config)
-    cfg["config_version"] = 2
+    cfg["config_version"] = 3
     cfg["starting_equity"] = max(1.0, float(cfg["starting_equity"]))
     cfg["scan_interval_minutes"] = max(1, int(cfg["scan_interval_minutes"]))
+    cfg["websocket_enabled"] = bool(cfg.get("websocket_enabled", True))
+    cfg["websocket_heartbeat_seconds"] = min(60, max(10, int(cfg.get("websocket_heartbeat_seconds", 25))))
+    cfg["live_ui_throttle_seconds"] = min(5.0, max(0.25, float(cfg.get("live_ui_throttle_seconds", 1.0))))
     cfg["risk_per_trade_pct"] = min(5.0, max(0.1, float(cfg["risk_per_trade_pct"])))
     cfg["fallback_risk_pct"] = min(cfg["risk_per_trade_pct"], max(0.05, float(cfg["fallback_risk_pct"])))
     cfg["max_leverage"] = min(20.0, max(1.0, float(cfg["max_leverage"])))
@@ -107,12 +114,25 @@ def load_config() -> dict[str, Any]:
     except (json.JSONDecodeError, OSError):
         loaded = {}
 
-    # v1.0.1 migration: old installations used a 10-minute default.
-    # Preserve any other user customizations while moving that legacy default to 5 minutes.
-    if int(loaded.get("config_version", 1)) < 2:
+    version = int(loaded.get("config_version", 1))
+
+    # v1.0.1 migration: the original default moved from 10 to 5 minutes.
+    if version < 2:
         if int(loaded.get("scan_interval_minutes", 10)) == 10:
             loaded["scan_interval_minutes"] = 5
-        loaded["config_version"] = 2
+        version = 2
+
+    # v1.1.0 migration: REST screening moves to one minute and a public
+    # WebSocket monitors an active virtual position between scans. Preserve
+    # non-default custom intervals, but migrate the old 5/10-minute defaults.
+    if version < 3:
+        if int(loaded.get("scan_interval_minutes", 5)) in {5, 10}:
+            loaded["scan_interval_minutes"] = 1
+        loaded["websocket_enabled"] = bool(loaded.get("websocket_enabled", True))
+        loaded["websocket_url"] = loaded.get("websocket_url", "wss://ws.bitget.com/v2/ws/public")
+        loaded["websocket_heartbeat_seconds"] = int(loaded.get("websocket_heartbeat_seconds", 25))
+        loaded["live_ui_throttle_seconds"] = float(loaded.get("live_ui_throttle_seconds", 1.0))
+        loaded["config_version"] = 3
 
     cfg = validate_config(loaded)
     save_config(cfg)

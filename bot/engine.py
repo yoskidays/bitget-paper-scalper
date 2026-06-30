@@ -14,6 +14,7 @@ from .models import AccountState, ContractInfo, Position, Signal, Ticker, utc_no
 from .reporting import build_html_report, calculate_metrics
 from .storage import Storage
 from .strategy import AnalysisInput, PullbackMomentumStrategy
+from .websocket_feed import BitgetTickerStream, LiveTicker
 
 EventCallback = Callable[[str, dict], None]
 
@@ -36,6 +37,18 @@ class PaperTradingEngine:
         self.latest_tickers: dict[str, Ticker] = {}
         self.last_candidates: list[Signal] = []
         self._cycle_lock = threading.Lock()
+        self._state_lock = threading.RLock()
+        self.live_ticker: LiveTicker | None = None
+        self.ws_connected = False
+        self.ws_symbol: str | None = None
+        self._last_live_emit = 0.0
+        self.stream = BitgetTickerStream(
+            self.config["websocket_url"],
+            self.config["product_type"],
+            self._on_live_tick,
+            self._on_ws_status,
+            self.config["websocket_heartbeat_seconds"],
+        ) if self.config.get("websocket_enabled", True) else None
 
     def emit(self, event: str, **payload) -> None:
         try:
@@ -51,12 +64,18 @@ class PaperTradingEngine:
         if self.is_running:
             return
         self.stop_event.clear()
+        if self.stream:
+            self.stream.start()
+            if self.state.open_position:
+                self.stream.set_symbol(self.state.open_position.symbol)
         self.thread = threading.Thread(target=self._loop, name="paper-scalper", daemon=True)
         self.thread.start()
-        self.emit("status", text="BOT BERJALAN")
+        self.emit("status", text="BOT BERJALAN • SCAN 1M")
 
     def stop(self) -> None:
         self.stop_event.set()
+        if self.stream:
+            self.stream.stop()
         self.emit("status", text="BOT DIHENTIKAN")
 
     def scan_now_async(self) -> None:
@@ -66,10 +85,18 @@ class PaperTradingEngine:
         threading.Thread(target=self.run_cycle, name="manual-scan", daemon=True).start()
 
     def _loop(self) -> None:
+        interval = self.config["scan_interval_minutes"] * 60.0
+        next_run = time.monotonic()
         while not self.stop_event.is_set():
             self.run_cycle()
-            interval = self.config["scan_interval_minutes"] * 60
-            self.stop_event.wait(interval)
+            next_run += interval
+            delay = next_run - time.monotonic()
+            if delay < 0:
+                # If a scan took longer than its cadence, resume immediately and
+                # reset the clock rather than accumulating increasing drift.
+                next_run = time.monotonic()
+                delay = 0.0
+            self.stop_event.wait(delay)
 
     def _refresh_day_guard(self) -> None:
         today = datetime.now(timezone.utc).date().isoformat()
@@ -159,6 +186,7 @@ class PaperTradingEngine:
                     candles_1h=self.client.get_candles(ticker.symbol, "1H", 240),
                     candles_15m=self.client.get_candles(ticker.symbol, "15m", 220),
                     candles_5m=self.client.get_candles(ticker.symbol, "5m", 220),
+                    candles_1m=self.client.get_candles(ticker.symbol, "1m", 180),
                     previous_open_interest=self.state.oi_snapshots.get(ticker.symbol),
                 )
                 signal = self.strategy.analyze(data)
@@ -261,44 +289,56 @@ class PaperTradingEngine:
             reasons=signal.reasons,
             last_checked_candle_ts=int(time.time() * 1000),
         )
-        self.state.open_position = position
+        with self._state_lock:
+            self.state.open_position = position
+        if self.stream:
+            self.stream.set_symbol(position.symbol)
         self._update_drawdown()
         self.storage.logger.info("OPEN PAPER %s %s qty=%s entry=%s", position.symbol, position.direction, qty, entry)
         self.emit("trade_open", position=position.to_dict())
 
     def _manage_position(self) -> None:
-        position = self.state.open_position
-        if not position:
-            return
-        ticker = self.latest_tickers.get(position.symbol)
-        if not ticker:
-            ticker_rows = self.client.get_tickers()
-            self.latest_tickers = {item.symbol: item for item in ticker_rows}
+        with self._state_lock:
+            position = self.state.open_position
+            if not position:
+                return
             ticker = self.latest_tickers.get(position.symbol)
-        if not ticker:
-            return
+            if not ticker:
+                ticker_rows = self.client.get_tickers()
+                self.latest_tickers = {item.symbol: item for item in ticker_rows}
+                ticker = self.latest_tickers.get(position.symbol)
+            if not ticker:
+                return
 
-        candles = self.client.get_candles(position.symbol, "5m", 100)
-        if len(candles) > 2:
-            candles = candles[:-1]
-        new_candles = [c for c in candles if c.timestamp > position.last_checked_candle_ts]
-        if not new_candles:
-            new_candles = candles[-1:]
-        for candle in new_candles:
-            position.last_checked_candle_ts = max(position.last_checked_candle_ts, candle.timestamp)
-            if self._process_candle(position, candle):
-                break
+            # WebSocket handles SL/TP continuously. REST 1M candles are retained as
+            # a fallback when the live feed is disconnected.
+            ws_live = bool(self.stream and self.stream.is_live_for(position.symbol))
+            if not ws_live:
+                candles = self.client.get_candles(position.symbol, "1m", 120)
+                if len(candles) > 2:
+                    candles = candles[:-1]
+                new_candles = [c for c in candles if c.timestamp > position.last_checked_candle_ts]
+                if not new_candles:
+                    new_candles = candles[-1:]
+                for candle in new_candles:
+                    position.last_checked_candle_ts = max(position.last_checked_candle_ts, candle.timestamp)
+                    if self._process_candle(position, candle):
+                        break
 
-        if self.state.open_position:
-            opened = datetime.fromisoformat(position.opened_at)
-            age_minutes = (datetime.now(timezone.utc) - opened).total_seconds() / 60.0
-            if age_minutes >= self.config["max_hold_minutes"]:
-                exit_reference = ticker.bid if position.direction == "LONG" else ticker.ask
-                self._close_all(position, exit_reference, "time_stop")
-            else:
-                mark = ticker.bid if position.direction == "LONG" else ticker.ask
-                unrealized = self._gross_pnl(position.direction, position.entry_price, mark, position.remaining_qty)
-                self._update_drawdown(self.state.balance + unrealized)
+            if self.state.open_position:
+                opened = datetime.fromisoformat(position.opened_at)
+                age_minutes = (datetime.now(timezone.utc) - opened).total_seconds() / 60.0
+                if age_minutes >= self.config["max_hold_minutes"]:
+                    exit_reference = ticker.bid if position.direction == "LONG" else ticker.ask
+                    self._close_all(position, exit_reference, "time_stop")
+                else:
+                    if self.live_ticker and self.live_ticker.symbol == position.symbol:
+                        mark = (self.live_ticker.executable_long_exit if position.direction == "LONG"
+                                else self.live_ticker.executable_short_exit)
+                    else:
+                        mark = ticker.bid if position.direction == "LONG" else ticker.ask
+                    unrealized = self._gross_pnl(position.direction, position.entry_price, mark, position.remaining_qty)
+                    self._update_drawdown(self.state.balance + unrealized)
 
     def _process_candle(self, position: Position, candle) -> bool:
         # Conservative intrabar assumption: if stop and target are both touched, stop is processed first.
@@ -392,8 +432,84 @@ class PaperTradingEngine:
         self.storage.append_trade(trade)
         self.storage.logger.info("CLOSE PAPER %s reason=%s net=%s", position.symbol, reason, net)
         self.state.open_position = None
+        if self.stream:
+            self.stream.set_symbol(None)
         self._check_daily_loss()
         self.emit("trade_close", trade=trade)
+
+    def _on_ws_status(self, event: str, payload: dict) -> None:
+        if event == "connected":
+            self.ws_connected = True
+            self.emit("ws_status", connected=True, symbol=payload.get("symbol"), text="WS TERHUBUNG")
+        elif event == "subscribed":
+            self.ws_connected = True
+            self.ws_symbol = payload.get("symbol")
+            self.emit("ws_status", connected=True, symbol=self.ws_symbol, text=f"WS LIVE {self.ws_symbol or ''}".strip())
+        elif event in {"disconnected", "reconnecting"}:
+            self.ws_connected = False
+            self.ws_symbol = None
+            text = "WS RECONNECT" if event == "reconnecting" else "WS TERPUTUS"
+            self.emit("ws_status", connected=False, symbol=None, text=text)
+        elif event == "unsubscribed":
+            self.ws_symbol = None
+            self.emit("ws_status", connected=self.ws_connected, symbol=None, text="WS SIAGA")
+        elif event == "error":
+            self.emit("error", text=f"WebSocket: {payload.get('text', 'unknown error')}")
+
+    def _on_live_tick(self, live: LiveTicker) -> None:
+        self.live_ticker = live
+        now = time.monotonic()
+        with self._state_lock:
+            position = self.state.open_position
+            if not position or position.symbol != live.symbol or self.stop_event.is_set():
+                return
+
+            executable = (live.executable_long_exit if position.direction == "LONG"
+                          else live.executable_short_exit)
+            if executable <= 0:
+                return
+
+            closed = False
+            if position.direction == "LONG":
+                if executable <= position.stop_price:
+                    self._close_all(position, executable, "stop_loss" if not position.tp1_hit else "breakeven_stop")
+                    closed = True
+                else:
+                    if not position.tp1_hit and executable >= position.tp1_price:
+                        self._take_partial(position, position.tp1_price)
+                        self.storage.save_state(self.state)
+                    if self.state.open_position and executable >= position.tp2_price:
+                        self._close_all(position, position.tp2_price, "take_profit_2")
+                        closed = True
+            else:
+                if executable >= position.stop_price:
+                    self._close_all(position, executable, "stop_loss" if not position.tp1_hit else "breakeven_stop")
+                    closed = True
+                else:
+                    if not position.tp1_hit and executable <= position.tp1_price:
+                        self._take_partial(position, position.tp1_price)
+                        self.storage.save_state(self.state)
+                    if self.state.open_position and executable <= position.tp2_price:
+                        self._close_all(position, position.tp2_price, "take_profit_2")
+                        closed = True
+
+            if not closed and self.state.open_position:
+                unrealized = self._gross_pnl(position.direction, position.entry_price, executable, position.remaining_qty)
+                self._update_drawdown(self.state.balance + unrealized)
+
+            throttle = self.config.get("live_ui_throttle_seconds", 1.0)
+            if closed or now - self._last_live_emit >= throttle:
+                self._last_live_emit = now
+                self.storage.save_state(self.state)
+                self.emit(
+                    "live_tick",
+                    symbol=live.symbol,
+                    price=live.last,
+                    bid=live.bid,
+                    ask=live.ask,
+                    timestamp_ms=live.timestamp_ms,
+                )
+                self.emit("state", state=self.snapshot())
 
     def close_position_async(self) -> None:
         def task() -> None:
@@ -426,6 +542,11 @@ class PaperTradingEngine:
             "open_position": self.state.open_position.to_dict() if self.state.open_position else None,
             "last_scan_at": self.state.last_scan_at,
             "daily_stop": self.state.stopped_for_daily_loss,
+            "websocket_enabled": bool(self.stream),
+            "websocket_connected": self.ws_connected,
+            "websocket_symbol": self.ws_symbol,
+            "live_price": self.live_ticker.last if self.live_ticker else None,
+            "live_price_ts": self.live_ticker.timestamp_ms if self.live_ticker else None,
             "metrics": metrics,
         }
 

@@ -34,7 +34,7 @@ class BitgetPublicClient:
                 allowed_methods=frozenset({"GET"}),
             )
             session.mount("https://", HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10))
-            session.headers.update({"User-Agent": "BitgetPaperScalper/1.0"})
+            session.headers.update({"User-Agent": "BitgetPaperScalper/1.1"})
             self._local.session = session
         return self._local.session
 

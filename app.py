@@ -23,6 +23,9 @@ class PaperScalperApp(tk.Tk):
         self.minsize(960, 620)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.events: queue.Queue[tuple[str, dict]] = queue.Queue()
+        self.ws_connected = False
+        self.ws_symbol: str | None = None
+        self.live_price: float | None = None
         self.engine = PaperTradingEngine(self.on_engine_event)
         self._build_style()
         self._build_ui()
@@ -52,7 +55,7 @@ class PaperScalperApp(tk.Tk):
         header = ttk.Frame(self, padding=(18, 14))
         header.pack(fill="x")
         ttk.Label(header, text="Bitget Paper Scalper", style="Title.TLabel").pack(side="left")
-        ttk.Label(header, text="PAPER TRADING • TANPA API KEY • TANPA ORDER REAL", foreground="#fbbf24").pack(side="left", padx=18)
+        ttk.Label(header, text="PAPER TRADING • SCAN 1 MENIT • MONITOR WS REAL-TIME • TANPA ORDER REAL", foreground="#fbbf24").pack(side="left", padx=18)
 
         button_bar = ttk.Frame(header)
         button_bar.pack(side="right")
@@ -125,6 +128,14 @@ class PaperScalperApp(tk.Tk):
                     self.metric_vars["status"].set(f"Scan {payload.get('current')}/{payload.get('total')}")
                 elif event == "candidates":
                     self.update_candidates(payload.get("items", []))
+                elif event == "ws_status":
+                    self.ws_connected = bool(payload.get("connected"))
+                    self.ws_symbol = payload.get("symbol")
+                    self.log(payload.get("text", "Status WebSocket berubah."))
+                    self.refresh_snapshot()
+                elif event == "live_tick":
+                    self.live_price = payload.get("price")
+                    self.ws_symbol = payload.get("symbol")
                 elif event == "trade_open":
                     p = payload["position"]
                     self.log(f"OPEN PAPER {p['symbol']} {p['direction']} @ {p['entry_price']:.8g} | SL {p['stop_price']:.8g} | TP2 {p['tp2_price']:.8g}")
@@ -141,7 +152,7 @@ class PaperScalperApp(tk.Tk):
 
     def start_bot(self) -> None:
         self.engine.start()
-        self.log("Bot dimulai. Scan pertama berjalan sekarang.")
+        self.log("Bot dimulai. Screening 1 menit aktif; posisi dipantau WebSocket real-time.")
 
     def stop_bot(self) -> None:
         self.engine.stop()
@@ -159,10 +170,28 @@ class PaperScalperApp(tk.Tk):
 
     def apply_snapshot(self, snapshot: dict) -> None:
         metrics = snapshot["metrics"]
-        self.metric_vars["status"].set("BERJALAN" if snapshot["running"] else "BERHENTI")
-        self.metric_vars["balance"].set(f"{snapshot['balance']:.4f} USDT")
+        self.ws_connected = bool(snapshot.get("websocket_connected", self.ws_connected))
+        self.ws_symbol = snapshot.get("websocket_symbol", self.ws_symbol)
+        self.live_price = snapshot.get("live_price", self.live_price)
         position = snapshot.get("open_position")
-        self.metric_vars["position"].set(f"{position['symbol']} {position['direction']}" if position else "Tidak ada")
+        if snapshot["running"]:
+            if position and self.ws_connected and self.ws_symbol:
+                status = "BERJALAN • WS LIVE"
+            elif position:
+                status = "BERJALAN • REST FALLBACK"
+            elif snapshot.get("websocket_enabled", True):
+                status = "BERJALAN • WS SIAGA"
+            else:
+                status = "BERJALAN • REST 1M"
+        else:
+            status = "BERHENTI"
+        self.metric_vars["status"].set(status)
+        self.metric_vars["balance"].set(f"{snapshot['balance']:.4f} USDT")
+        if position:
+            live_suffix = f" @ {self.live_price:.8g}" if self.live_price and self.ws_symbol == position["symbol"] else ""
+            self.metric_vars["position"].set(f"{position['symbol']} {position['direction']}{live_suffix}")
+        else:
+            self.metric_vars["position"].set("Tidak ada")
         self.metric_vars["return"].set(f"{metrics['return_pct']:+.3f}%")
         self.metric_vars["winrate"].set(f"{metrics['win_rate']:.1f}% ({metrics['trades']})")
         self.metric_vars["drawdown"].set(f"{metrics['max_drawdown_pct']:.3f}%")
@@ -219,7 +248,7 @@ class PaperScalperApp(tk.Tk):
         window.geometry("460x540")
         window.configure(bg="#111827")
         fields = [
-            ("scan_interval_minutes", "Interval scan (menit)"),
+            ("scan_interval_minutes", "Interval screening (menit)"),
             ("starting_equity", "Modal awal virtual"),
             ("risk_per_trade_pct", "Risiko per trade (%)"),
             ("max_leverage", "Maks leverage virtual"),
@@ -243,8 +272,10 @@ class PaperScalperApp(tk.Tk):
 
         fallback_var = tk.BooleanVar(value=bool(cfg["fallback_enabled"]))
         auto_start_var = tk.BooleanVar(value=bool(cfg.get("auto_start_bot", True)))
+        websocket_var = tk.BooleanVar(value=bool(cfg.get("websocket_enabled", True)))
         ttk.Checkbutton(form, text="Aktifkan fallback paper trade", variable=fallback_var).grid(row=len(fields), column=0, columnspan=2, sticky="w", pady=6)
-        ttk.Checkbutton(form, text="Mulai bot otomatis saat aplikasi dibuka", variable=auto_start_var).grid(row=len(fields)+1, column=0, columnspan=2, sticky="w", pady=6)
+        ttk.Checkbutton(form, text="Aktifkan monitor harga WebSocket real-time", variable=websocket_var).grid(row=len(fields)+1, column=0, columnspan=2, sticky="w", pady=6)
+        ttk.Checkbutton(form, text="Mulai bot otomatis saat aplikasi dibuka", variable=auto_start_var).grid(row=len(fields)+2, column=0, columnspan=2, sticky="w", pady=6)
 
         def save() -> None:
             try:
@@ -254,6 +285,7 @@ class PaperScalperApp(tk.Tk):
                     value = entries[key].get().strip()
                     updated[key] = int(value) if isinstance(old, int) and not isinstance(old, bool) else float(value)
                 updated["fallback_enabled"] = fallback_var.get()
+                updated["websocket_enabled"] = websocket_var.get()
                 updated["auto_start_bot"] = auto_start_var.get()
                 save_config(updated)
                 messagebox.showinfo("Pengaturan", "Tersimpan. Restart aplikasi agar seluruh perubahan diterapkan.")
@@ -261,7 +293,7 @@ class PaperScalperApp(tk.Tk):
             except ValueError:
                 messagebox.showerror("Input salah", "Gunakan angka yang valid.")
 
-        ttk.Button(form, text="Simpan", command=save).grid(row=len(fields)+2, column=0, columnspan=2, pady=16)
+        ttk.Button(form, text="Simpan", command=save).grid(row=len(fields)+3, column=0, columnspan=2, pady=16)
 
     def reset_account(self) -> None:
         if self.engine.is_running:
