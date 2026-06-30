@@ -14,7 +14,11 @@ class ConfigTests(unittest.TestCase):
 
     def test_legacy_ten_minute_config_is_migrated(self):
         with tempfile.TemporaryDirectory() as tmp:
-            with patch.dict(os.environ, {"XDG_DATA_HOME": tmp}, clear=False):
+            with patch.dict(
+                os.environ,
+                {"XDG_DATA_HOME": tmp, "LOCALAPPDATA": tmp},
+                clear=False,
+            ):
                 app_dir = Path(tmp) / "BitgetPaperScalper"
                 app_dir.mkdir(parents=True, exist_ok=True)
                 config_file = app_dir / "config.json"
